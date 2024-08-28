@@ -1,0 +1,13 @@
+[package]
+name = "nmea-monitor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { version = "1.0.86", features = ["backtrace"] }
+clap = { version = "4.5.16", features = ["derive"] }
+crossterm = { version = "0.28.1", features = ["event-stream"] }
+futures = "0.3.30"
+nmea = "0.6.0"
+ratatui = "0.28.1"
+tokio = { version = "1.39.3", features = ["full"] }
