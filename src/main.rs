@@ -16,6 +16,7 @@ use tokio::{
     fs::File,
     io::{AsyncBufReadExt, AsyncRead, BufReader},
     sync::RwLock,
+    time::Instant,
 };
 
 #[derive(Parser, Debug)]
@@ -23,6 +24,9 @@ struct Args {
     source: Option<String>,
     #[clap(short, long, default_value_t = Default::default())]
     r#type: SourceType,
+
+    #[clap(long, default_value = "1s")]
+    timeout: humantime::Duration,
 }
 
 #[derive(ValueEnum, Default, PartialEq, Eq, Clone, Copy, Debug)]
@@ -45,7 +49,7 @@ impl Display for SourceType {
 async fn main() {
     let args = Args::parse();
 
-    let nmea = Arc::new(RwLock::new(NmeaStatus::default()));
+    let nmea = Arc::new(RwLock::new(NmeaStatus::new(args.timeout.into())));
 
     {
         let nmea = Arc::clone(&nmea);
@@ -67,10 +71,10 @@ async fn main() {
                         match parsed {
                             ParseResult::GGA(gga) => {
                                 let mut nmea = nmea.write().await;
-                                nmea.lat = gga.latitude;
-                                nmea.lon = gga.longitude;
-                                nmea.alt = gga.altitude.map(From::from);
-                                nmea.fix_type = gga.fix_type.map(|t| match t {
+                                nmea.lat.update(gga.latitude);
+                                nmea.lon.update(gga.longitude);
+                                nmea.alt.update(gga.altitude.map(From::from));
+                                nmea.fix_type.update(gga.fix_type.map(|t| match t {
                                     FixType::Invalid => "Invalid",
                                     FixType::Gps => "Gps",
                                     FixType::DGps => "DGps",
@@ -80,7 +84,7 @@ async fn main() {
                                     FixType::Estimated => "Estimated",
                                     FixType::Manual => "Manual",
                                     FixType::Simulation => "Simulation",
-                                });
+                                }));
                             }
                             _ => {}
                         }
@@ -101,13 +105,27 @@ async fn main() {
 
 #[derive(Default, Debug)]
 struct NmeaStatus {
-    lat: Option<f64>,
-    lon: Option<f64>,
-    alt: Option<f64>,
-    hdg: Option<f64>,
-    sog: Option<f64>,
-    cog: Option<f64>,
-    fix_type: Option<&'static str>,
+    lat: StatusValue<f64>,
+    lon: StatusValue<f64>,
+    alt: StatusValue<f64>,
+    hdg: StatusValue<f64>,
+    sog: StatusValue<f64>,
+    cog: StatusValue<f64>,
+    fix_type: StatusValue<&'static str>,
+}
+
+impl NmeaStatus {
+    pub fn new(timeout: Duration) -> NmeaStatus {
+        NmeaStatus {
+            lat: StatusValue::new(timeout),
+            lon: StatusValue::new(timeout),
+            alt: StatusValue::new(timeout),
+            hdg: StatusValue::new(timeout),
+            sog: StatusValue::new(timeout),
+            cog: StatusValue::new(timeout),
+            fix_type: StatusValue::new(timeout),
+        }
+    }
 }
 
 async fn run(mut terminal: Terminal<impl Backend>, nmea: Arc<RwLock<NmeaStatus>>) -> Result<()> {
@@ -141,53 +159,68 @@ fn draw(frame: &mut Frame, nmea: &NmeaStatus) {
     .flex(Flex::Start)
     .areas(frame.area());
 
-    render_statistics(
-        frame,
-        lat,
-        "latitude",
-        nmea.lat.as_ref().map(ToString::to_string),
-    );
-    render_statistics(
-        frame,
-        lon,
-        "longitude",
-        nmea.lon.as_ref().map(ToString::to_string),
-    );
-    render_statistics(
-        frame,
-        alt,
-        "altitude",
-        nmea.alt.as_ref().map(ToString::to_string),
-    );
-    render_statistics(
-        frame,
-        hdg,
-        "heading",
-        nmea.hdg.as_ref().map(ToString::to_string),
-    );
-    render_statistics(
-        frame,
-        sog,
-        "sog",
-        nmea.sog.as_ref().map(ToString::to_string),
-    );
-    render_statistics(
-        frame,
-        cog,
-        "cog",
-        nmea.cog.as_ref().map(ToString::to_string),
-    );
-    render_statistics(frame, fix, "fix", nmea.fix_type.map(ToString::to_string));
+    render_statistics(frame, lat, "latitude", nmea.lat.clone());
+    render_statistics(frame, lon, "longitude", nmea.lon.clone());
+    render_statistics(frame, alt, "altitude", nmea.alt.clone());
+    render_statistics(frame, hdg, "heading", nmea.hdg.clone());
+    render_statistics(frame, sog, "sog", nmea.sog.clone());
+    render_statistics(frame, cog, "cog", nmea.cog.clone());
+    render_statistics(frame, fix, "fix", nmea.fix_type.clone());
 }
 
-fn render_statistics<'a, T>(frame: &mut Frame, area: Rect, title: &str, value: Option<T>)
+fn render_statistics<'a, T>(frame: &mut Frame, area: Rect, title: &str, value: T)
 where
     T: Into<Text<'a>>,
 {
     let block = Block::new().title(title);
-    if let Some(value) = value {
-        frame.render_widget(Paragraph::new(value).block(block), area);
-    } else {
-        frame.render_widget(Paragraph::new("null").block(block), area);
+    frame.render_widget(Paragraph::new(value).block(block), area);
+}
+
+#[derive(Clone, Debug)]
+struct StatusValue<T> {
+    inner: Option<T>,
+    updated_at: Instant,
+    timeout: Duration,
+}
+
+impl<T> Default for StatusValue<T> {
+    fn default() -> Self {
+        StatusValue {
+            inner: None,
+            updated_at: Instant::now(),
+            timeout: Duration::from_secs(5),
+        }
+    }
+}
+
+impl<T> StatusValue<T> {
+    pub fn new(timeout: Duration) -> StatusValue<T> {
+        StatusValue {
+            timeout,
+            ..Default::default()
+        }
+    }
+
+    pub fn update(&mut self, next: impl Into<Option<T>>) {
+        self.inner = next.into();
+        self.updated_at = Instant::now();
+    }
+
+    pub fn get(&self) -> Option<&T> {
+        self.inner
+            .as_ref()
+            .filter(|_| self.updated_at.elapsed() < self.timeout)
+    }
+}
+
+impl<T> From<StatusValue<T>> for Text<'_>
+where
+    T: ToString,
+{
+    fn from(value: StatusValue<T>) -> Self {
+        match value.get() {
+            Some(v) => Text::from(v.to_string()),
+            None => Text::from("value"),
+        }
     }
 }
